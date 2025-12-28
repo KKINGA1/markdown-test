@@ -124,20 +124,14 @@ export default {
                 // 按块级元素分割，确保每个块都是完整的 HTML 结构
                 const blocks = this.splitIntoCompleteBlocks(styledHtml);
                 
-                // 智能合并未完成的段落
+                // 智能合并未完成的块（段落、列表、表格等）
                 blocks.forEach((blockHtml) => {
                     if (blockHtml.trim()) {
-                        // 检查最后一个块是否是未完成的段落
                         const lastBlock = this.renderBlocks[this.renderBlocks.length - 1];
-                        const isLastBlockParagraph = lastBlock && this.isParagraphBlock(lastBlock.html);
-                        const isCurrentBlockParagraph = this.isParagraphBlock(blockHtml);
                         
-                        // 如果最后一个块是段落，且当前块也是段落，且最后一个块未完成，则合并它们
-                        if (isLastBlockParagraph && isCurrentBlockParagraph && !this.isParagraphComplete(lastBlock.html)) {
-                            // 合并段落：移除最后一个块的 </p>，移除当前块的 <p>，合并内容
-                            const lastBlockContent = lastBlock.html.replace(/<\/p>\s*$/, '');
-                            const currentBlockContent = blockHtml.replace(/^<p[^>]*>/, '').replace(/<\/p>\s*$/, '');
-                            lastBlock.html = lastBlockContent + currentBlockContent + '</p>';
+                        // 尝试合并到最后一个块
+                        if (lastBlock && this.shouldMergeBlocks(lastBlock.html, blockHtml)) {
+                            this.mergeBlocks(lastBlock, blockHtml);
                         } else {
                             // 否则，创建新块
                             const blockId = `md-block-${this.blockCounter++}`;
@@ -160,26 +154,205 @@ export default {
         },
 
         /**
+         * 判断是否应该合并两个块
+         * 合并规则：
+         * 1. 段落：如果最后一个块是未完成的段落，且当前块也是段落，则合并
+         * 2. 列表：如果最后一个块是未完成的列表，且当前块是列表项、列表或段落（需要转换为列表项），则合并
+         * 3. 表格：如果最后一个块是未完成的表格，且当前块是表格行或表格，则合并
+         * 4. 引用块：如果最后一个块是未完成的引用块，且当前块也是引用块内容，则合并
+         */
+        shouldMergeBlocks(lastBlockHtml, currentBlockHtml) {
+            if (!lastBlockHtml || !currentBlockHtml) return false;
+
+            // 1. 段落合并
+            if (this.isParagraphBlock(lastBlockHtml) && this.isParagraphBlock(currentBlockHtml)) {
+                return !this.isParagraphComplete(lastBlockHtml);
+            }
+
+            // 2. 列表合并
+            if (this.isIncompleteList(lastBlockHtml)) {
+                // 如果最后一个块是未完成的列表，且当前块是列表项、列表或段落（可能是列表项被渲染成了段落），则合并
+                return this.isListItemBlock(currentBlockHtml) || 
+                       this.isListBlock(currentBlockHtml) || 
+                       this.isParagraphBlock(currentBlockHtml);
+            }
+
+            // 3. 表格合并
+            if (this.isIncompleteTable(lastBlockHtml)) {
+                // 如果最后一个块是未完成的表格，且当前块是表格行或表格，则合并
+                return this.isTableRowBlock(currentBlockHtml) || this.isTableBlock(currentBlockHtml);
+            }
+
+            // 4. 引用块合并
+            if (this.isIncompleteBlockquote(lastBlockHtml)) {
+                return this.isBlockquoteContent(currentBlockHtml);
+            }
+
+            return false;
+        },
+
+        /**
+         * 合并两个块
+         */
+        mergeBlocks(lastBlock, currentBlockHtml) {
+            const lastHtml = lastBlock.html;
+            const currentHtml = currentBlockHtml;
+
+            // 1. 段落合并
+            if (this.isParagraphBlock(lastHtml) && this.isParagraphBlock(currentHtml)) {
+                const lastContent = lastHtml.replace(/<\/p>\s*$/, '');
+                const currentContent = currentHtml.replace(/^<p[^>]*>/, '').replace(/<\/p>\s*$/, '');
+                lastBlock.html = lastContent + currentContent + '</p>';
+                return;
+            }
+
+            // 2. 列表合并
+            if (this.isIncompleteList(lastHtml)) {
+                // 确定列表类型（ul 或 ol）
+                const listTypeMatch = lastHtml.match(/<([uo]l)(?:\s[^>]*)?>/i);
+                const listType = listTypeMatch ? listTypeMatch[1].toLowerCase() : 'ul';
+                const listTag = listType === 'ul' ? 'ul' : 'ol';
+
+                if (this.isListItemBlock(currentHtml)) {
+                    // 当前块是列表项，直接追加到列表
+                    const lastContent = lastHtml.replace(/<\/[uo]l>/gi, '');
+                    lastBlock.html = lastContent + currentHtml + `</${listTag}>`;
+                } else if (this.isListBlock(currentHtml)) {
+                    // 当前块是列表，合并列表项
+                    const listItems = currentHtml.match(/<li[^>]*>[\s\S]*?<\/li>/gi) || [];
+                    const lastContent = lastHtml.replace(/<\/[uo]l>/gi, '');
+                    lastBlock.html = lastContent + listItems.join('') + `</${listTag}>`;
+                } else if (this.isParagraphBlock(currentHtml)) {
+                    // 当前块是段落，但应该作为列表项（marked 可能将列表项渲染成了段落）
+                    // 提取段落内容，转换为列表项
+                    const paragraphContent = currentHtml.replace(/^<p[^>]*>/, '').replace(/<\/p>\s*$/, '');
+                    const lastContent = lastHtml.replace(/<\/[uo]l>/gi, '');
+                    lastBlock.html = lastContent + `<li>${paragraphContent}</li></${listTag}>`;
+                }
+                return;
+            }
+
+            // 3. 表格合并
+            if (this.isIncompleteTable(lastHtml)) {
+                if (this.isTableRowBlock(currentHtml)) {
+                    // 当前块是表格行，追加到表格
+                    const lastContent = lastHtml.replace(/<\/table>\s*$/i, '');
+                    lastBlock.html = lastContent + currentHtml + '</table>';
+                } else if (this.isTableBlock(currentHtml)) {
+                    // 当前块是表格，合并行
+                    const tableRows = currentHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
+                    const lastContent = lastHtml.replace(/<\/table>\s*$/i, '');
+                    lastBlock.html = lastContent + tableRows.join('') + '</table>';
+                }
+                return;
+            }
+
+            // 4. 引用块合并
+            if (this.isIncompleteBlockquote(lastHtml)) {
+                const lastContent = lastHtml.replace(/<\/blockquote>\s*$/i, '');
+                let currentContent = currentHtml;
+                // 移除当前块的 blockquote 标签（如果有）
+                currentContent = currentContent.replace(/^<blockquote[^>]*>/i, '').replace(/<\/blockquote>\s*$/i, '');
+                lastBlock.html = lastContent + currentContent + '</blockquote>';
+                return;
+            }
+        },
+
+        /**
          * 判断一个 HTML 块是否是段落（<p> 标签）
          */
         isParagraphBlock(html) {
             if (!html) return false;
-            // 检查是否以 <p> 开始并以 </p> 结束
             const trimmed = html.trim();
             return /^<p(?:\s[^>]*)?>/.test(trimmed) && /<\/p>\s*$/.test(trimmed);
         },
 
         /**
          * 判断段落是否已完成（以句号、问号、感叹号等结束）
-         * 如果段落已完成，不应该与下一个段落合并
          */
         isParagraphComplete(html) {
             if (!html) return false;
-            // 提取段落内的文本内容（去除 HTML 标签）
             const textContent = html.replace(/<[^>]+>/g, '').trim();
-            // 检查是否以句号、问号、感叹号、换行符等结束
-            // 也检查是否包含图片（图片通常表示段落结束）
             return /[。！？.!?]\s*$/.test(textContent) || /<img/.test(html);
+        },
+
+        /**
+         * 判断是否是未完成的列表（有 <ul> 或 <ol> 但没有对应的 </ul> 或 </ol>）
+         */
+        isIncompleteList(html) {
+            if (!html) return false;
+            const trimmed = html.trim();
+            const hasListStart = /<[uo]l(?:\s[^>]*)?>/i.test(trimmed);
+            const hasListEnd = /<\/[uo]l>/i.test(trimmed);
+            return hasListStart && !hasListEnd;
+        },
+
+        /**
+         * 判断是否是列表项块（<li> 标签）
+         */
+        isListItemBlock(html) {
+            if (!html) return false;
+            const trimmed = html.trim();
+            return /^<li(?:\s[^>]*)?>/.test(trimmed) && /<\/li>\s*$/.test(trimmed);
+        },
+
+        /**
+         * 判断是否是列表块（<ul> 或 <ol> 标签）
+         */
+        isListBlock(html) {
+            if (!html) return false;
+            const trimmed = html.trim();
+            return /^<[uo]l(?:\s[^>]*)?>/i.test(trimmed) && /<\/[uo]l>\s*$/i.test(trimmed);
+        },
+
+        /**
+         * 判断是否是未完成的表格（有 <table> 但没有 </table>）
+         */
+        isIncompleteTable(html) {
+            if (!html) return false;
+            const trimmed = html.trim();
+            const hasTableStart = /<table(?:\s[^>]*)?>/i.test(trimmed);
+            const hasTableEnd = /<\/table>/i.test(trimmed);
+            return hasTableStart && !hasTableEnd;
+        },
+
+        /**
+         * 判断是否是表格行块（<tr> 标签）
+         */
+        isTableRowBlock(html) {
+            if (!html) return false;
+            const trimmed = html.trim();
+            return /^<tr(?:\s[^>]*)?>/.test(trimmed) && /<\/tr>\s*$/.test(trimmed);
+        },
+
+        /**
+         * 判断是否是表格块（<table> 标签）
+         */
+        isTableBlock(html) {
+            if (!html) return false;
+            const trimmed = html.trim();
+            return /^<table(?:\s[^>]*)?>/i.test(trimmed) && /<\/table>\s*$/i.test(trimmed);
+        },
+
+        /**
+         * 判断是否是未完成的引用块（有 <blockquote> 但没有 </blockquote>）
+         */
+        isIncompleteBlockquote(html) {
+            if (!html) return false;
+            const trimmed = html.trim();
+            const hasBlockquoteStart = /<blockquote(?:\s[^>]*)?>/i.test(trimmed);
+            const hasBlockquoteEnd = /<\/blockquote>/i.test(trimmed);
+            return hasBlockquoteStart && !hasBlockquoteEnd;
+        },
+
+        /**
+         * 判断是否是引用块内容
+         */
+        isBlockquoteContent(html) {
+            if (!html) return false;
+            const trimmed = html.trim();
+            // 可以是段落、列表等任何块级元素
+            return /^<(p|h[1-6]|ul|ol|blockquote)(?:\s[^>]*)?>/i.test(trimmed);
         },
 
         /**
