@@ -41,7 +41,9 @@ export default {
             // 当前已处理的内容长度，用于增量更新
             processedLength: 0,
             // 块计数器，用于生成唯一 ID
-            blockCounter: 0
+            blockCounter: 0,
+            // 累积的 markdown 源码（用于延迟渲染）
+            accumulatedMarkdown: ''
         };
     },
     watch: {
@@ -50,17 +52,30 @@ export default {
             handler(newContent, oldContent) {
                 this.handleContentUpdate(newContent);
             }
+        },
+        isCompleted: {
+            handler(isCompleted) {
+                // 当内容完成时，渲染剩余的累积内容
+                if (isCompleted && this.accumulatedMarkdown) {
+                    if (this.accumulatedMarkdown.trim()) {
+                        this.appendNewContent(this.accumulatedMarkdown);
+                    }
+                    this.accumulatedMarkdown = '';
+                }
+            }
         }
     },
     methods: {
         /**
-         * 处理内容更新，使用增量渲染策略
+         * 处理内容更新，使用智能增量渲染策略
+         * 累积 markdown 源码，在块级边界处进行渲染，避免碎片化
          */
         handleContentUpdate(newContent) {
             if (!newContent) {
                 this.renderBlocks = [];
                 this.processedLength = 0;
                 this.blockCounter = 0;
+                this.accumulatedMarkdown = '';
                 return;
             }
 
@@ -69,17 +84,206 @@ export default {
                 this.renderBlocks = [];
                 this.processedLength = 0;
                 this.blockCounter = 0;
+                this.accumulatedMarkdown = '';
             }
 
             // 获取新增的内容部分
             const newPart = newContent.substring(this.processedLength);
             
-            if (newPart.trim()) {
-                // 增量渲染新内容
-                this.appendNewContent(newPart);
+            if (newPart) {
+                // 累积新增内容
+                this.accumulatedMarkdown += newPart;
+                
+                // 检测块级边界，在边界处进行渲染
+                this.processAccumulatedContent();
             }
 
             this.processedLength = newContent.length;
+        },
+
+        /**
+         * 处理累积的 markdown 内容，在块级边界处进行渲染
+         */
+        processAccumulatedContent() {
+            if (!this.accumulatedMarkdown) return;
+
+            // 检测块级边界（段落结束、列表项结束、标题结束等）
+            const blockBoundaries = this.detectBlockBoundaries(this.accumulatedMarkdown);
+            
+            if (blockBoundaries.length > 0) {
+                // 有完整的块，渲染这些块
+                let lastIndex = 0;
+                blockBoundaries.forEach((boundaryIndex) => {
+                    const blockMarkdown = this.accumulatedMarkdown.substring(lastIndex, boundaryIndex + 1);
+                    if (blockMarkdown.trim()) {
+                        this.appendNewContent(blockMarkdown);
+                    }
+                    lastIndex = boundaryIndex + 1;
+                });
+                
+                // 保留未完成的块
+                this.accumulatedMarkdown = this.accumulatedMarkdown.substring(lastIndex);
+            }
+            
+            // 如果内容很长但没有块级边界，强制渲染一部分（避免内存问题）
+            if (this.accumulatedMarkdown.length > 1000) {
+                // 尝试在最近的换行处分割
+                const lastNewline = this.accumulatedMarkdown.lastIndexOf('\n');
+                if (lastNewline > 100) {
+                    const blockMarkdown = this.accumulatedMarkdown.substring(0, lastNewline + 1);
+                    this.appendNewContent(blockMarkdown);
+                    this.accumulatedMarkdown = this.accumulatedMarkdown.substring(lastNewline + 1);
+                }
+            }
+        },
+
+        /**
+         * 检测 markdown 中的块级边界
+         * 返回所有完整块的结束位置索引数组
+         */
+        detectBlockBoundaries(markdown) {
+            const boundaries = [];
+            const lines = markdown.split('\n');
+            const state = {
+                currentIndex: 0,
+                inCodeBlock: false,
+                codeBlockFence: '',
+                inList: false,
+                listIndent: -1,
+                lastNonEmptyLineIndex: -1
+            };
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const lineStartIndex = state.currentIndex;
+                const lineEndIndex = state.currentIndex + line.length;
+                const isEmptyLine = line.trim() === '';
+                
+                // 处理代码块
+                if (this.processCodeBlock(line, i, lineEndIndex, state, boundaries, lineStartIndex)) {
+                    state.currentIndex = lineEndIndex + 1;
+                    continue;
+                }
+                
+                if (state.inCodeBlock) {
+                    state.currentIndex = lineEndIndex + 1;
+                    continue;
+                }
+                
+                // 处理标题
+                if (this.processHeading(line, i, lineEndIndex, state, boundaries, lineStartIndex)) {
+                    state.currentIndex = lineEndIndex + 1;
+                    continue;
+                }
+                
+                // 处理列表项
+                if (this.processListItem(line, i, isEmptyLine, lineEndIndex, state, boundaries, lineStartIndex)) {
+                    state.currentIndex = lineEndIndex + 1;
+                    continue;
+                }
+                
+                // 处理空行（块级边界）
+                this.processEmptyLine(line, i, isEmptyLine, lines, lineStartIndex, state, boundaries);
+                
+                state.currentIndex = lineEndIndex + 1;
+            }
+            
+            return boundaries;
+        },
+
+        /**
+         * 处理代码块检测
+         */
+        processCodeBlock(line, lineIndex, lineEndIndex, state, boundaries, lineStartIndex) {
+            const codeBlockMatch = line.match(/^(\s*)(```|~~~)/);
+            if (!codeBlockMatch) return false;
+            
+            if (!state.inCodeBlock) {
+                // 代码块开始
+                if (state.lastNonEmptyLineIndex >= 0 && state.lastNonEmptyLineIndex < lineIndex - 1) {
+                    boundaries.push(state.currentIndex - 1);
+                }
+                state.inCodeBlock = true;
+                state.codeBlockFence = codeBlockMatch[2];
+            } else if (codeBlockMatch[2] === state.codeBlockFence) {
+                // 代码块结束
+                state.inCodeBlock = false;
+                state.codeBlockFence = '';
+                boundaries.push(lineEndIndex);
+                state.lastNonEmptyLineIndex = lineIndex;
+                return true;
+            }
+            return false;
+        },
+
+        /**
+         * 处理标题检测
+         */
+        processHeading(line, lineIndex, lineEndIndex, state, boundaries, lineStartIndex) {
+            if (!/^#{1,6}\s+/.test(line) || state.inList) return false;
+            
+            if (state.lastNonEmptyLineIndex >= 0 && state.lastNonEmptyLineIndex < lineIndex - 1) {
+                boundaries.push(lineStartIndex - 1);
+            }
+            boundaries.push(lineEndIndex);
+            state.lastNonEmptyLineIndex = lineIndex;
+            return true;
+        },
+
+        /**
+         * 处理列表项检测
+         */
+        processListItem(line, lineIndex, isEmptyLine, lineEndIndex, state, boundaries, lineStartIndex) {
+            if (isEmptyLine) return false;
+            
+            const listMatch = line.match(/^(\s*)([-*+]|\d+\.)\s+/);
+            if (!listMatch) return false;
+            
+            const indent = listMatch[1].length;
+            if (!state.inList || indent < state.listIndent) {
+                // 新列表开始，或列表层级变化（降级）
+                if (state.inList && state.lastNonEmptyLineIndex >= 0) {
+                    boundaries.push(lineStartIndex - 1);
+                }
+                state.inList = true;
+                state.listIndent = indent;
+            }
+            state.lastNonEmptyLineIndex = lineIndex;
+            return true;
+        },
+
+        /**
+         * 处理空行（块级边界）
+         */
+        processEmptyLine(line, lineIndex, isEmptyLine, lines, lineStartIndex, state, boundaries) {
+            if (!isEmptyLine) {
+                // 非空行
+                if (!state.inList) {
+                    state.lastNonEmptyLineIndex = lineIndex;
+                }
+                return;
+            }
+            
+            // 空行处理
+            if (state.lastNonEmptyLineIndex >= 0 && state.lastNonEmptyLineIndex < lineIndex - 1) {
+                boundaries.push(lineStartIndex - 1);
+            }
+            
+            if (state.inList) {
+                // 列表在空行后结束（除非下一行继续列表）
+                if (lineIndex < lines.length - 1) {
+                    const nextLine = lines[lineIndex + 1];
+                    const nextListMatch = nextLine.match(/^(\s*)([-*+]|\d+\.)\s+/);
+                    const nextIndent = nextListMatch ? nextListMatch[1].length : -1;
+                    if (!nextListMatch || nextIndent < state.listIndent) {
+                        state.inList = false;
+                        state.listIndent = -1;
+                    }
+                } else {
+                    state.inList = false;
+                    state.listIndent = -1;
+                }
+            }
         },
 
         /**
@@ -130,8 +334,24 @@ export default {
                         const lastBlock = this.renderBlocks[this.renderBlocks.length - 1];
                         
                         // 尝试合并到最后一个块
+                        // 重要：如果最后一个块包含图片，不要合并，避免图片闪烁
                         if (lastBlock && this.shouldMergeBlocks(lastBlock.html, blockHtml)) {
-                            this.mergeBlocks(lastBlock, blockHtml);
+                            // 检查最后一个块是否包含图片
+                            if (this.containsImage(lastBlock.html)) {
+                                // 如果包含图片，创建新块而不是合并，避免图片闪烁
+                                const blockId = `md-block-${this.blockCounter++}`;
+                                this.renderBlocks.push({
+                                    id: blockId,
+                                    html: blockHtml
+                                });
+                            } else {
+                                // 不包含图片，可以安全合并
+                                const mergedBlock = this.mergeBlocks(lastBlock, blockHtml);
+                                if (mergedBlock) {
+                                    // 更新最后一个块
+                                    Object.assign(lastBlock, mergedBlock);
+                                }
+                            }
                         } else {
                             // 否则，创建新块
                             const blockId = `md-block-${this.blockCounter++}`;
@@ -197,13 +417,14 @@ export default {
         mergeBlocks(lastBlock, currentBlockHtml) {
             const lastHtml = lastBlock.html;
             const currentHtml = currentBlockHtml;
+            const updatedBlock = {...lastBlock};
 
             // 1. 段落合并
             if (this.isParagraphBlock(lastHtml) && this.isParagraphBlock(currentHtml)) {
                 const lastContent = lastHtml.replace(/<\/p>\s*$/, '');
                 const currentContent = currentHtml.replace(/^<p[^>]*>/, '').replace(/<\/p>\s*$/, '');
-                lastBlock.html = lastContent + currentContent + '</p>';
-                return;
+                updatedBlock.html = lastContent + currentContent + '</p>';
+                return updatedBlock;
             }
 
             // 2. 列表合并
@@ -216,20 +437,20 @@ export default {
                 if (this.isListItemBlock(currentHtml)) {
                     // 当前块是列表项，直接追加到列表
                     const lastContent = lastHtml.replace(/<\/[uo]l>/gi, '');
-                    lastBlock.html = lastContent + currentHtml + `</${listTag}>`;
+                    updatedBlock.html = lastContent + currentHtml + `</${listTag}>`;
                 } else if (this.isListBlock(currentHtml)) {
                     // 当前块是列表，合并列表项
                     const listItems = currentHtml.match(/<li[^>]*>[\s\S]*?<\/li>/gi) || [];
                     const lastContent = lastHtml.replace(/<\/[uo]l>/gi, '');
-                    lastBlock.html = lastContent + listItems.join('') + `</${listTag}>`;
+                    updatedBlock.html = lastContent + listItems.join('') + `</${listTag}>`;
                 } else if (this.isParagraphBlock(currentHtml)) {
                     // 当前块是段落，但应该作为列表项（marked 可能将列表项渲染成了段落）
                     // 提取段落内容，转换为列表项
                     const paragraphContent = currentHtml.replace(/^<p[^>]*>/, '').replace(/<\/p>\s*$/, '');
                     const lastContent = lastHtml.replace(/<\/[uo]l>/gi, '');
-                    lastBlock.html = lastContent + `<li>${paragraphContent}</li></${listTag}>`;
+                    updatedBlock.html = lastContent + `<li>${paragraphContent}</li></${listTag}>`;
                 }
-                return;
+                return updatedBlock;
             }
 
             // 3. 表格合并
@@ -237,14 +458,14 @@ export default {
                 if (this.isTableRowBlock(currentHtml)) {
                     // 当前块是表格行，追加到表格
                     const lastContent = lastHtml.replace(/<\/table>\s*$/i, '');
-                    lastBlock.html = lastContent + currentHtml + '</table>';
+                    updatedBlock.html = lastContent + currentHtml + '</table>';
                 } else if (this.isTableBlock(currentHtml)) {
                     // 当前块是表格，合并行
                     const tableRows = currentHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
                     const lastContent = lastHtml.replace(/<\/table>\s*$/i, '');
-                    lastBlock.html = lastContent + tableRows.join('') + '</table>';
+                    updatedBlock.html = lastContent + tableRows.join('') + '</table>';
                 }
-                return;
+                return updatedBlock;
             }
 
             // 4. 引用块合并
@@ -253,8 +474,8 @@ export default {
                 let currentContent = currentHtml;
                 // 移除当前块的 blockquote 标签（如果有）
                 currentContent = currentContent.replace(/^<blockquote[^>]*>/i, '').replace(/<\/blockquote>\s*$/i, '');
-                lastBlock.html = lastContent + currentContent + '</blockquote>';
-                return;
+                updatedBlock.html = lastContent + currentContent + '</blockquote>';
+                return updatedBlock;
             }
         },
 
@@ -357,7 +578,6 @@ export default {
 
         /**
          * 将 HTML 按块级元素分割，确保每个块都是完整的 HTML 结构
-         * 使用栈来正确跟踪嵌套的 HTML 标签，确保只在顶级块边界分割
          */
         splitIntoCompleteBlocks(html) {
             if (!html || !html.trim()) {
@@ -365,11 +585,10 @@ export default {
             }
 
             const blocks = [];
-            const stack = []; // 用于跟踪嵌套的标签
+            const stack = [];
             let currentBlockStart = -1;
             let i = 0;
 
-            // 顶级块级元素（这些元素通常不会嵌套在其他块级元素中，或者嵌套时应该作为一个整体）
             const topLevelBlockElements = [
                 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
                 'ul', 'ol', 'blockquote', 'pre',
@@ -377,90 +596,123 @@ export default {
             ];
 
             while (i < html.length) {
-                // 查找开始标签
+                // 处理开始标签
                 if (html[i] === '<' && html[i + 1] !== '/' && html[i + 1] !== '!') {
-                    const tagMatch = html.substring(i).match(/^<(\w+)(?:\s[^>]*)?(?:\s*\/)?>/);
-                    if (tagMatch) {
-                        const tagName = tagMatch[1].toLowerCase();
-                        const isTopLevelBlock = topLevelBlockElements.includes(tagName);
-                        const isSelfClosing = tagMatch[0].endsWith('/>') || this.isSelfClosingTag(tagName);
-
-                        if (isTopLevelBlock) {
-                            if (isSelfClosing) {
-                                // 自闭合的块级元素（如 <hr />）
-                                if (stack.length === 0) {
-                                    // 保存之前的块（如果有）
-                                    if (currentBlockStart >= 0 && i > currentBlockStart) {
-                                        const prevBlock = html.substring(currentBlockStart, i).trim();
-                                        if (prevBlock) {
-                                            blocks.push(prevBlock);
-                                        }
-                                    }
-                                    // 添加自闭合标签作为一个块
-                                    const tagEnd = i + tagMatch[0].length;
-                                    blocks.push(html.substring(i, tagEnd));
-                                    currentBlockStart = -1;
-                                    i = tagEnd;
-                                    continue;
-                                }
-                            } else {
-                                // 非自闭合的块级元素
-                                if (stack.length === 0) {
-                                    // 这是一个新的顶级块
-                                    if (currentBlockStart >= 0 && i > currentBlockStart) {
-                                        const prevBlock = html.substring(currentBlockStart, i).trim();
-                                        if (prevBlock) {
-                                            blocks.push(prevBlock);
-                                        }
-                                    }
-                                    currentBlockStart = i;
-                                }
-                                stack.push({ name: tagName, index: i });
-                            }
-                        } else if (stack.length > 0 && !isSelfClosing) {
-                            // 在块内的标签，继续跟踪
-                            stack.push({ name: tagName, index: i });
-                        }
+                    const result = this.processStartTag(html, i, stack, currentBlockStart, blocks, topLevelBlockElements);
+                    if (result) {
+                        currentBlockStart = result.currentBlockStart;
+                        i = result.nextIndex;
+                        continue;
                     }
                 } else if (html[i] === '<' && html[i + 1] === '/') {
-                    // 闭合标签
-                    const closeTagMatch = html.substring(i).match(/^<\/(\w+)>/);
-                    if (closeTagMatch && stack.length > 0) {
-                        const tagName = closeTagMatch[1].toLowerCase();
-                        
-                        // 查找匹配的开始标签
-                        for (let j = stack.length - 1; j >= 0; j--) {
-                            if (stack[j].name === tagName) {
-                                // 移除从 j 到栈顶的所有标签
-                                stack.splice(j);
-                                
-                                // 如果栈为空，说明一个完整的顶级块结束了
-                                if (stack.length === 0 && currentBlockStart >= 0 && topLevelBlockElements.includes(tagName)) {
-                                    const blockEnd = i + closeTagMatch[0].length;
-                                    const completeBlock = html.substring(currentBlockStart, blockEnd);
-                                    blocks.push(completeBlock);
-                                    currentBlockStart = -1;
-                                }
-                                break;
-                            }
-                        }
+                    // 处理闭合标签
+                    const result = this.processCloseTag(html, i, stack, currentBlockStart, blocks, topLevelBlockElements);
+                    if (result) {
+                        currentBlockStart = result.currentBlockStart;
                     }
                 }
                 i++;
             }
 
-            // 处理最后一个块（如果有）
+            // 处理最后一个块
+            this.processLastBlock(html, currentBlockStart, blocks);
+
+            return blocks;
+        },
+
+        /**
+         * 处理开始标签
+         */
+        processStartTag(html, i, stack, currentBlockStart, blocks, topLevelBlockElements) {
+            const tagMatch = html.substring(i).match(/^<(\w+)(?:\s[^>]*)?(?:\s*\/)?>/);
+            if (!tagMatch) return null;
+
+            const tagName = tagMatch[1].toLowerCase();
+            const isTopLevelBlock = topLevelBlockElements.includes(tagName);
+            const isSelfClosing = tagMatch[0].endsWith('/>') || this.isSelfClosingTag(tagName);
+
+            if (!isTopLevelBlock) {
+                if (stack.length > 0 && !isSelfClosing) {
+                    stack.push({ name: tagName, index: i });
+                }
+                return null;
+            }
+
+            if (isSelfClosing) {
+                return this.handleSelfClosingBlock(html, i, tagMatch, currentBlockStart, blocks);
+            } else {
+                return this.handleNonSelfClosingBlock(html, i, tagName, stack, currentBlockStart, blocks);
+            }
+        },
+
+        /**
+         * 处理自闭合的块级元素
+         */
+        handleSelfClosingBlock(html, i, tagMatch, currentBlockStart, blocks) {
+            if (currentBlockStart >= 0 && i > currentBlockStart) {
+                const prevBlock = html.substring(currentBlockStart, i).trim();
+                if (prevBlock) {
+                    blocks.push(prevBlock);
+                }
+            }
+            const tagEnd = i + tagMatch[0].length;
+            blocks.push(html.substring(i, tagEnd));
+            return { currentBlockStart: -1, nextIndex: tagEnd };
+        },
+
+        /**
+         * 处理非自闭合的块级元素
+         */
+        handleNonSelfClosingBlock(html, i, tagName, stack, currentBlockStart, blocks) {
+            if (currentBlockStart >= 0 && i > currentBlockStart) {
+                const prevBlock = html.substring(currentBlockStart, i).trim();
+                if (prevBlock) {
+                    blocks.push(prevBlock);
+                }
+            }
+            stack.push({ name: tagName, index: i });
+            return { currentBlockStart: i, nextIndex: i + 1 };
+        },
+
+        /**
+         * 处理闭合标签
+         */
+        processCloseTag(html, i, stack, currentBlockStart, blocks, topLevelBlockElements) {
+            const closeTagMatch = html.substring(i).match(/^<\/(\w+)>/);
+            if (!closeTagMatch || stack.length === 0) return null;
+
+            const tagName = closeTagMatch[1].toLowerCase();
+            
+            // 查找匹配的开始标签
+            for (let j = stack.length - 1; j >= 0; j--) {
+                if (stack[j].name === tagName) {
+                    stack.splice(j);
+                    
+                    // 如果栈为空，说明一个完整的顶级块结束了
+                    if (stack.length === 0 && currentBlockStart >= 0 && topLevelBlockElements.includes(tagName)) {
+                        const blockEnd = i + closeTagMatch[0].length;
+                        const completeBlock = html.substring(currentBlockStart, blockEnd);
+                        blocks.push(completeBlock);
+                        return { currentBlockStart: -1 };
+                    }
+                    break;
+                }
+            }
+            return null;
+        },
+
+        /**
+         * 处理最后一个块
+         */
+        processLastBlock(html, currentBlockStart, blocks) {
             if (currentBlockStart >= 0 && currentBlockStart < html.length) {
                 const lastBlock = html.substring(currentBlockStart).trim();
                 if (lastBlock) {
                     blocks.push(lastBlock);
                 }
             } else if (blocks.length === 0) {
-                // 如果没有找到任何块级元素，返回整个 HTML
                 blocks.push(html);
             }
-
-            return blocks;
         },
 
         /**
@@ -469,6 +721,16 @@ export default {
         isSelfClosingTag(tagName) {
             const selfClosingTags = ['img', 'br', 'hr', 'input'];
             return selfClosingTags.includes(tagName.toLowerCase());
+        },
+
+        /**
+         * 检查 HTML 块是否包含图片
+         * 用于判断是否可以安全合并块而不导致图片闪烁
+         */
+        containsImage(html) {
+            if (!html) return false;
+            // 检查是否包含 <img> 标签
+            return /<img[\s\S]*?>/i.test(html);
         }
     }
 }
