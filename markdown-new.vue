@@ -144,7 +144,7 @@ export default {
         detectBlockBoundaries(markdown) {
             const boundaries = [];
             const lines = markdown.split('\n');
-            const state = {
+            let state = {
                 currentIndex: 0,
                 inCodeBlock: false,
                 codeBlockFence: '',
@@ -160,9 +160,13 @@ export default {
                 const isEmptyLine = line.trim() === '';
                 
                 // 处理代码块
-                if (this.processCodeBlock(line, i, lineEndIndex, state, boundaries, lineStartIndex)) {
-                    state.currentIndex = lineEndIndex + 1;
-                    continue;
+                const codeBlockResult = this.processCodeBlock(line, i, lineEndIndex, state, boundaries, lineStartIndex);
+                if (codeBlockResult) {
+                    state = { ...state, ...codeBlockResult.stateUpdate };
+                    if (codeBlockResult.shouldContinue) {
+                        state.currentIndex = lineEndIndex + 1;
+                        continue;
+                    }
                 }
                 
                 if (state.inCodeBlock) {
@@ -171,19 +175,26 @@ export default {
                 }
                 
                 // 处理标题
-                if (this.processHeading(line, i, lineEndIndex, state, boundaries, lineStartIndex)) {
+                const headingResult = this.processHeading(line, i, lineEndIndex, state, boundaries, lineStartIndex);
+                if (headingResult) {
+                    state = { ...state, ...headingResult.stateUpdate };
                     state.currentIndex = lineEndIndex + 1;
                     continue;
                 }
                 
                 // 处理列表项
-                if (this.processListItem(line, i, isEmptyLine, lineEndIndex, state, boundaries, lineStartIndex)) {
+                const listItemResult = this.processListItem(line, i, isEmptyLine, lineEndIndex, state, boundaries, lineStartIndex);
+                if (listItemResult) {
+                    state = { ...state, ...listItemResult.stateUpdate };
                     state.currentIndex = lineEndIndex + 1;
                     continue;
                 }
                 
                 // 处理空行（块级边界）
-                this.processEmptyLine(line, i, isEmptyLine, lines, lineStartIndex, state, boundaries);
+                const emptyLineResult = this.processEmptyLine(line, i, isEmptyLine, lines, lineStartIndex, state, boundaries);
+                if (emptyLineResult && emptyLineResult.stateUpdate) {
+                    state = { ...state, ...emptyLineResult.stateUpdate };
+                }
                 
                 state.currentIndex = lineEndIndex + 1;
             }
@@ -193,75 +204,104 @@ export default {
 
         /**
          * 处理代码块检测
+         * @returns {Object|null} 包含 shouldContinue 和 stateUpdate 的对象，或 null
          */
         processCodeBlock(line, lineIndex, lineEndIndex, state, boundaries, lineStartIndex) {
             const codeBlockMatch = line.match(/^(\s*)(```|~~~)/);
-            if (!codeBlockMatch) return false;
+            if (!codeBlockMatch) return null;
             
             if (!state.inCodeBlock) {
                 // 代码块开始
                 if (state.lastNonEmptyLineIndex >= 0 && state.lastNonEmptyLineIndex < lineIndex - 1) {
                     boundaries.push(state.currentIndex - 1);
                 }
-                state.inCodeBlock = true;
-                state.codeBlockFence = codeBlockMatch[2];
-            } else if (codeBlockMatch[2] === state.codeBlockFence) {
-                // 代码块结束
-                state.inCodeBlock = false;
-                state.codeBlockFence = '';
-                boundaries.push(lineEndIndex);
-                state.lastNonEmptyLineIndex = lineIndex;
-                return true;
+                return {
+                    shouldContinue: false,
+                    stateUpdate: {
+                        inCodeBlock: true,
+                        codeBlockFence: codeBlockMatch[2]
+                    }
+                };
             }
-            return false;
+            if (codeBlockMatch[2] === state.codeBlockFence) {
+                // 代码块结束
+                boundaries.push(lineEndIndex);
+                return {
+                    shouldContinue: true,
+                    stateUpdate: {
+                        inCodeBlock: false,
+                        codeBlockFence: '',
+                        lastNonEmptyLineIndex: lineIndex
+                    }
+                };
+            }
+            return null;
         },
 
         /**
          * 处理标题检测
+         * @returns {Object|null} 包含 shouldContinue 和 stateUpdate 的对象，或 null
          */
         processHeading(line, lineIndex, lineEndIndex, state, boundaries, lineStartIndex) {
-            if (!/^#{1,6}\s+/.test(line) || state.inList) return false;
+            if (!/^#{1,6}\s+/.test(line) || state.inList) return null;
             
             if (state.lastNonEmptyLineIndex >= 0 && state.lastNonEmptyLineIndex < lineIndex - 1) {
                 boundaries.push(lineStartIndex - 1);
             }
             boundaries.push(lineEndIndex);
-            state.lastNonEmptyLineIndex = lineIndex;
-            return true;
+            return {
+                shouldContinue: true,
+                stateUpdate: {
+                    lastNonEmptyLineIndex: lineIndex
+                }
+            };
         },
 
         /**
          * 处理列表项检测
+         * @returns {Object|null} 包含 shouldContinue 和 stateUpdate 的对象，或 null
          */
         processListItem(line, lineIndex, isEmptyLine, lineEndIndex, state, boundaries, lineStartIndex) {
-            if (isEmptyLine) return false;
+            if (isEmptyLine) return null;
             
             const listMatch = line.match(/^(\s*)([-*+]|\d+\.)\s+/);
-            if (!listMatch) return false;
+            if (!listMatch) return null;
             
             const indent = listMatch[1].length;
+            const stateUpdate = {
+                lastNonEmptyLineIndex: lineIndex
+            };
+            
             if (!state.inList || indent < state.listIndent) {
                 // 新列表开始，或列表层级变化（降级）
                 if (state.inList && state.lastNonEmptyLineIndex >= 0) {
                     boundaries.push(lineStartIndex - 1);
                 }
-                state.inList = true;
-                state.listIndent = indent;
+                stateUpdate.inList = true;
+                stateUpdate.listIndent = indent;
             }
-            state.lastNonEmptyLineIndex = lineIndex;
-            return true;
+            
+            return {
+                shouldContinue: true,
+                stateUpdate
+            };
         },
 
         /**
          * 处理空行（块级边界）
+         * @returns {Object|null} 包含 stateUpdate 的对象，或 null
          */
         processEmptyLine(line, lineIndex, isEmptyLine, lines, lineStartIndex, state, boundaries) {
             if (!isEmptyLine) {
                 // 非空行
                 if (!state.inList) {
-                    state.lastNonEmptyLineIndex = lineIndex;
+                    return {
+                        stateUpdate: {
+                            lastNonEmptyLineIndex: lineIndex
+                        }
+                    };
                 }
-                return;
+                return null;
             }
             
             // 空行处理
@@ -271,19 +311,23 @@ export default {
             
             if (state.inList) {
                 // 列表在空行后结束（除非下一行继续列表）
+                const stateUpdate = {};
                 if (lineIndex < lines.length - 1) {
                     const nextLine = lines[lineIndex + 1];
                     const nextListMatch = nextLine.match(/^(\s*)([-*+]|\d+\.)\s+/);
                     const nextIndent = nextListMatch ? nextListMatch[1].length : -1;
                     if (!nextListMatch || nextIndent < state.listIndent) {
-                        state.inList = false;
-                        state.listIndent = -1;
+                        stateUpdate.inList = false;
+                        stateUpdate.listIndent = -1;
                     }
                 } else {
-                    state.inList = false;
-                    state.listIndent = -1;
+                    stateUpdate.inList = false;
+                    stateUpdate.listIndent = -1;
                 }
+                return Object.keys(stateUpdate).length > 0 ? { stateUpdate } : null;
             }
+            
+            return null;
         },
 
         /**
@@ -331,7 +375,8 @@ export default {
                 // 智能合并未完成的块（段落、列表、表格等）
                 blocks.forEach((blockHtml) => {
                     if (blockHtml.trim()) {
-                        const lastBlock = this.renderBlocks[this.renderBlocks.length - 1];
+                        // 使用数组解构获取最后一个块
+                        const [lastBlock] = this.renderBlocks.slice(-1);
                         
                         // 尝试合并到最后一个块
                         // 重要：如果最后一个块包含图片，不要合并，避免图片闪烁
@@ -348,8 +393,9 @@ export default {
                                 // 不包含图片，可以安全合并
                                 const mergedBlock = this.mergeBlocks(lastBlock, blockHtml);
                                 if (mergedBlock) {
-                                    // 更新最后一个块
-                                    Object.assign(lastBlock, mergedBlock);
+                                    // 更新最后一个块（使用索引更新，避免直接修改参数）
+                                    const lastIndex = this.renderBlocks.length - 1;
+                                    this.renderBlocks[lastIndex] = mergedBlock;
                                 }
                             }
                         } else {
@@ -413,6 +459,9 @@ export default {
 
         /**
          * 合并两个块
+         * @param {Object} lastBlock - 最后一个块对象
+         * @param {string} currentBlockHtml - 当前块的 HTML
+         * @returns {Object|null} 合并后的块对象，如果无法合并则返回 null
          */
         mergeBlocks(lastBlock, currentBlockHtml) {
             const lastHtml = lastBlock.html;
@@ -438,19 +487,25 @@ export default {
                     // 当前块是列表项，直接追加到列表
                     const lastContent = lastHtml.replace(/<\/[uo]l>/gi, '');
                     updatedBlock.html = lastContent + currentHtml + `</${listTag}>`;
-                } else if (this.isListBlock(currentHtml)) {
+                    return updatedBlock;
+                }
+                if (this.isListBlock(currentHtml)) {
                     // 当前块是列表，合并列表项
                     const listItems = currentHtml.match(/<li[^>]*>[\s\S]*?<\/li>/gi) || [];
                     const lastContent = lastHtml.replace(/<\/[uo]l>/gi, '');
                     updatedBlock.html = lastContent + listItems.join('') + `</${listTag}>`;
-                } else if (this.isParagraphBlock(currentHtml)) {
+                    return updatedBlock;
+                }
+                if (this.isParagraphBlock(currentHtml)) {
                     // 当前块是段落，但应该作为列表项（marked 可能将列表项渲染成了段落）
                     // 提取段落内容，转换为列表项
                     const paragraphContent = currentHtml.replace(/^<p[^>]*>/, '').replace(/<\/p>\s*$/, '');
                     const lastContent = lastHtml.replace(/<\/[uo]l>/gi, '');
                     updatedBlock.html = lastContent + `<li>${paragraphContent}</li></${listTag}>`;
+                    return updatedBlock;
                 }
-                return updatedBlock;
+                // 列表块但无法合并，返回 null
+                return null;
             }
 
             // 3. 表格合并
@@ -459,13 +514,17 @@ export default {
                     // 当前块是表格行，追加到表格
                     const lastContent = lastHtml.replace(/<\/table>\s*$/i, '');
                     updatedBlock.html = lastContent + currentHtml + '</table>';
-                } else if (this.isTableBlock(currentHtml)) {
+                    return updatedBlock;
+                }
+                if (this.isTableBlock(currentHtml)) {
                     // 当前块是表格，合并行
                     const tableRows = currentHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
                     const lastContent = lastHtml.replace(/<\/table>\s*$/i, '');
                     updatedBlock.html = lastContent + tableRows.join('') + '</table>';
+                    return updatedBlock;
                 }
-                return updatedBlock;
+                // 表格块但无法合并，返回 null
+                return null;
             }
 
             // 4. 引用块合并
@@ -477,6 +536,9 @@ export default {
                 updatedBlock.html = lastContent + currentContent + '</blockquote>';
                 return updatedBlock;
             }
+
+            // 无法合并，返回 null
+            return null;
         },
 
         /**
